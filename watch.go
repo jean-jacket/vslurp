@@ -8,7 +8,8 @@ package main
 import (
 	"container/list"
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -39,6 +40,10 @@ demand into memory with read-ahead and is never saved. If mpv can't be started,
 the local URL is printed instead. Arguments in -mpv-args, then any after --,
 are passed to mpv.
 
+The local URL is the same every time for the same video, so mpv's saved
+positions (Shift+Q, or save-position-on-quit) resume across runs. If its port
+is in use, watch exits; pick another with -port (which changes the URL).
+
 Flags:
 `)
 		fs.PrintDefaults()
@@ -48,6 +53,7 @@ Flags:
 type watchOpts struct {
 	options
 	noMPV       bool
+	port        int
 	memMB       int
 	readaheadMB int
 	partMB      int
@@ -64,6 +70,7 @@ func runWatch(args []string) int {
 	fs.IntVar(&o.memMB, "mem", 256, "memory buffer for video data, in MB")
 	fs.IntVar(&o.readaheadMB, "readahead", 64, "how far ahead of the player to download, in MB")
 	fs.IntVar(&o.partMB, "part-size", 2, "download part size in MB")
+	fs.IntVar(&o.port, "port", 0, "local port to serve on (default: derived from the URL, 20000-29999)")
 	var mpvFlag string
 	fs.StringVar(&mpvFlag, "mpv-args", "", "extra arguments for mpv, as one string (e.g. \"--hr-seek=no --volume=50\")")
 	fs.Usage = watchUsage(fs)
@@ -117,6 +124,23 @@ func runWatch(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// The address depends only on the source URL, so mpv can remember playback
+	// positions across runs. Take the port first so a clash fails right away.
+	port, urlPath := stableAddress(url)
+	if o.port != 0 {
+		port = o.port
+	}
+	name := fileName(url)
+	host := fmt.Sprintf("127.0.0.1:%d", port)
+	ln, err := net.Listen("tcp", host)
+	if err != nil {
+		errorf("can't serve on port %d: %v", port, err)
+		fmt.Fprintln(os.Stderr, "Another vslurp watch of this video may be running, or another program uses the port. Pick one with -port.")
+		return 1
+	}
+	defer ln.Close()
+	local := "http://" + host + urlPath
+
 	o.options.partMB = 8 // the index download uses the normal part size
 	src, err := openSource(ctx, o.options, url)
 	if err != nil {
@@ -134,19 +158,8 @@ func runWatch(args []string) int {
 	defer cancel()
 	w.start(wctx)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		errorf("starting local server: %v", err)
-		return 1
-	}
-	token := make([]byte, 16)
-	rand.Read(token)
-	name := fileName(url)
-	urlPath := "/" + hex.EncodeToString(token) + "/" + neturl.PathEscape(name)
-	local := "http://" + ln.Addr().String() + urlPath
-
 	srv := &http.Server{
-		Handler:           w.handler(urlPath, name),
+		Handler:           w.handler(host, urlPath, name),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go srv.Serve(ln)
@@ -218,6 +231,15 @@ func splitWords(s string) ([]string, error) {
 		words = append(words, cur.String())
 	}
 	return words, nil
+}
+
+// stableAddress derives the local port (20000-29999) and URL path for a source
+// URL. The same URL always gets the same address; the file name comes last so
+// players show something readable.
+func stableAddress(url string) (port int, urlPath string) {
+	sum := sha256.Sum256([]byte("vslurp watch\x00" + url))
+	port = 20000 + int(binary.BigEndian.Uint32(sum[:4])%10000)
+	return port, "/" + hex.EncodeToString(sum[4:12]) + "/" + neturl.PathEscape(fileName(url))
 }
 
 func indexOf(xs []string, s string) int {
@@ -468,8 +490,14 @@ type reqReader struct {
 
 func (r reqReader) ReadAt(p []byte, off int64) (int, error) { return r.w.readAt(r.ctx, p, off) }
 
-func (w *watcher) handler(urlPath, name string) http.Handler {
+func (w *watcher) handler(host, urlPath, name string) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		// Only answer requests addressed to us by IP. A web page can't make the
+		// browser send that Host header, so this blocks DNS-rebinding tricks.
+		if req.Host != host {
+			http.Error(rw, "forbidden", http.StatusForbidden)
+			return
+		}
 		if req.URL.EscapedPath() != urlPath && req.URL.Path != urlPath {
 			http.NotFound(rw, req)
 			return

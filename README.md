@@ -51,13 +51,22 @@ supported yet.
 ```
 vslurp watch URL                        # opens mpv
 vslurp watch -mpv-args '--hr-seek=no --volume=50' URL   # extra mpv arguments
+vslurp watch -port 23456 URL            # choose the port
 vslurp watch URL -- --hr-seek=no        # arguments after -- also go to mpv
 vslurp watch -no-mpv URL                # just print the local URL
 ```
 
 Serves the remote video to mpv from a local web server that only this machine can
-reach (127.0.0.1, random port, random secret in the URL). It stops when mpv exits.
-If mpv can't be started, it prints the URL and keeps serving until Ctrl-C.
+reach (127.0.0.1). It stops when mpv exits. If mpv can't be started, it prints the
+URL and keeps serving until Ctrl-C.
+
+The local URL is the same every time for the same video (the port, 20000-29999,
+and the path are derived from the source URL), so mpv's saved positions work: quit
+with Shift+Q or set `save-position-on-quit=yes`, and the next `vslurp watch` of
+that video resumes there. If the port is already in use, `watch` exits with an
+error; `-port` picks another (which changes the URL, so saved positions won't
+match). Requests are only answered if addressed to `127.0.0.1:<port>`, which stops
+web pages from reaching the server through DNS tricks.
 
 Only the index is cached on disk, so opening is fast after the first time. Video data
 is downloaded on demand into a fixed memory buffer (`-mem`, default 256 MB) with

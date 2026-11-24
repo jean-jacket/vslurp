@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/binary"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -381,5 +383,44 @@ func TestCutComment(t *testing.T) {
 	act.startStr = "02:00:00.000000" // already on a keyframe
 	if got, want := cutComment("u", req, act), "Source: u\nRange: 02:00:00-end"; got != want {
 		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestStableAddress(t *testing.T) {
+	const u = "https://archive.example/vods/a/20_clip.mp4"
+	p1, path1 := stableAddress(u)
+	p2, path2 := stableAddress(u)
+	if p1 != p2 || path1 != path2 {
+		t.Errorf("not stable: %d %s vs %d %s", p1, path1, p2, path2)
+	}
+	if p1 < 20000 || p1 > 29999 {
+		t.Errorf("port %d out of range", p1)
+	}
+	if !strings.HasSuffix(path1, "/20_clip.mp4") {
+		t.Errorf("path %q should end with the file name", path1)
+	}
+	if p3, path3 := stableAddress(u + "?x"); path3 == path1 && p3 == p1 {
+		t.Error("different URLs got the same address")
+	}
+}
+
+func TestWatchHandlerHostCheck(t *testing.T) {
+	w := &watcher{length: 0}
+	h := w.handler("127.0.0.1:20001", "/abc/v.mp4", "v.mp4")
+	for _, c := range []struct {
+		host, path string
+		want       int
+	}{
+		{"127.0.0.1:20001", "/abc/v.mp4", 200},
+		{"evil.example:20001", "/abc/v.mp4", 403},
+		{"localhost:20001", "/abc/v.mp4", 403},
+		{"127.0.0.1:20001", "/other.mp4", 404},
+	} {
+		req := httptest.NewRequest("HEAD", "http://"+c.host+c.path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != c.want {
+			t.Errorf("Host %s path %s: got %d, want %d", c.host, c.path, rec.Code, c.want)
+		}
 	}
 }
