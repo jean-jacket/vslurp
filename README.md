@@ -20,6 +20,14 @@ negative timestamps and edit lists ffmpeg otherwise produces, which many players
 editors mishandle. In the files tested, keyframes were about 4 s apart, so a clip can
 start up to that much earlier than asked. The end time is not changed.
 
+Each cut gets a comment tag recording where it came from, which ffprobe, mpv and most
+players show:
+
+```
+Source: https://example.com/vod.mp4
+Range: 05:59:57.449-06:05:00 (requested 06:00:00-06:05:00)
+```
+
 If a run is interrupted, run the same command again and it resumes. Different cuts
 of the same URL reuse whatever was already downloaded.
 

@@ -28,8 +28,9 @@ type trackCut struct {
 
 // planCut lays out the cut covering presentation times [startSec, endSec].
 // startSec must already be on a video keyframe (see snapToKeyframe); endSec < 0
-// means to the end of the video.
-func (m *movie) planCut(ftyp []byte, startSec, endSec float64) (*cutPlan, error) {
+// means to the end of the video. A non-empty comment is stored as the file's
+// comment tag.
+func (m *movie) planCut(ftyp []byte, startSec, endSec float64, comment string) (*cutPlan, error) {
 	if m.timescale == 0 {
 		return nil, errors.New("missing mvhd timescale")
 	}
@@ -58,12 +59,12 @@ func (m *movie) planCut(ftyp []byte, startSec, endSec float64) (*cutPlan, error)
 	// The moov's size doesn't depend on the data offset (co64 entries are fixed
 	// width), so build it once to measure it, then again with the real offset.
 	const mdatHdr = 16
-	moov, err := m.buildMoov(cuts, lo, 0)
+	moov, err := m.buildMoov(cuts, lo, 0, comment)
 	if err != nil {
 		return nil, err
 	}
 	base := int64(len(ftyp)+len(moov)) + mdatHdr
-	moov, err = m.buildMoov(cuts, lo, base)
+	moov, err = m.buildMoov(cuts, lo, base, comment)
 	if err != nil {
 		return nil, err
 	}
@@ -241,7 +242,7 @@ func withDuration(raw []byte, b box, v0Off, v1Off int64, dur uint64) []byte {
 	return out
 }
 
-func (m *movie) buildMoov(cuts []*trackCut, lo, base int64) ([]byte, error) {
+func (m *movie) buildMoov(cuts []*trackCut, lo, base int64, comment string) ([]byte, error) {
 	byTrak := map[int64]*trackCut{}
 	var movieDur uint64
 	for _, c := range cuts {
@@ -263,11 +264,36 @@ func (m *movie) buildMoov(cuts []*trackCut, lo, base int64) ([]byte, error) {
 				return nil, err
 			}
 			body = append(body, trak...)
+		case "udta":
+			if comment == "" {
+				body = append(body, boxBytes(m.raw, k)...)
+			}
+			// Otherwise the source's own tags are replaced by ours below.
 		default:
 			body = append(body, boxBytes(m.raw, k)...)
 		}
 	}
+	if comment != "" {
+		body = append(body, commentUdta(comment)...)
+	}
 	return appendBox(nil, "moov", body), nil
+}
+
+// commentUdta builds the iTunes-style metadata that ffmpeg and most players
+// read as the "comment" tag: udta > meta > (hdlr "mdir", ilst > ©cmt > data).
+func commentUdta(comment string) []byte {
+	hdlr := []byte{0, 0, 0, 0} // version, flags
+	hdlr = binary.BigEndian.AppendUint32(hdlr, 0)
+	hdlr = append(hdlr, "mdir"...)
+	hdlr = append(hdlr, "appl"...)
+	hdlr = append(hdlr, make([]byte, 8)...)       // reserved
+	hdlr = append(hdlr, 0)                        // empty name
+	data := binary.BigEndian.AppendUint32(nil, 1) // type 1: UTF-8 text
+	data = binary.BigEndian.AppendUint32(data, 0) // locale
+	data = append(data, comment...)
+	ilst := appendBox(nil, "ilst", appendBox(nil, "\xa9cmt", appendBox(nil, "data", data)))
+	meta := appendBox(nil, "meta", []byte{0, 0, 0, 0}, appendBox(nil, "hdlr", hdlr), ilst)
+	return appendBox(nil, "udta", meta)
 }
 
 func (m *movie) buildTrak(c *trackCut, lo, base int64) ([]byte, error) {

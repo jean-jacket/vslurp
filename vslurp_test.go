@@ -240,7 +240,7 @@ func TestPlanCut(t *testing.T) {
 	}
 	ftyp := mkbox("ftyp", []byte("isom"), be32(0))
 	// Keyframes at 0, 4, 8 s. Cut 4 s .. 7.5 s: samples 4..7 (index), 3.5 s presented.
-	plan, err := src.planCut(ftyp, 4, 7.5)
+	plan, err := src.planCut(ftyp, 4, 7.5, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func TestPlanCut(t *testing.T) {
 	}
 
 	// Open-ended: from 8 s to the end is samples 8..9.
-	plan, err = src.planCut(ftyp, 8, -1)
+	plan, err = src.planCut(ftyp, 8, -1, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,5 +327,59 @@ func TestSplitWords(t *testing.T) {
 		if _, err := splitWords(bad); err == nil {
 			t.Errorf("splitWords(%q): expected error", bad)
 		}
+	}
+}
+
+func TestPlanCutComment(t *testing.T) {
+	src, err := parseMoov(testMoovFull())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ftyp := mkbox("ftyp", []byte("isom"), be32(0))
+	const comment = "Source: https://example.com/v.mp4\nRange: 00:00:04-00:00:07.5"
+	plan, err := src.planCut(ftyp, 4, 7.5, comment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := plan.header
+	mb, _ := parseBoxHeader(h[len(ftyp):], int64(len(ftyp)), int64(len(h)))
+	data, ok := findChild(h, mb.start, mb.end, "udta", "meta")
+	if !ok {
+		t.Fatal("no udta/meta in moov")
+	}
+	// meta is a full box: skip version/flags before its children.
+	d, ok := findChild(h, data.start+4, data.end, "ilst", "\xa9cmt", "data")
+	if !ok {
+		t.Fatal("no ilst/©cmt/data")
+	}
+	if got := string(h[d.start+8 : d.end]); got != comment {
+		t.Errorf("comment = %q", got)
+	}
+	if hd, ok := findChild(h, data.start+4, data.end, "hdlr"); !ok || string(h[hd.start+8:hd.start+12]) != "mdir" {
+		t.Error("missing mdir handler")
+	}
+	// The rest of the index still parses.
+	if _, err := parseMoov(h[mb.offset:mb.end]); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestCutComment(t *testing.T) {
+	req, _ := parseRange("06:00:00-06:05:00")
+	act := req
+	act.startStr = "05:59:57.449000"
+	if got, want := cutComment("https://x/v.mp4", req, act),
+		"Source: https://x/v.mp4\nRange: 05:59:57.449-06:05:00 (requested 06:00:00-06:05:00)"; got != want {
+		t.Errorf("got %q\nwant %q", got, want)
+	}
+	req, _ = parseRange("-01:00:00")
+	if got, want := cutComment("u", req, req), "Source: u\nRange: start-01:00:00"; got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+	req, _ = parseRange("02:00:00-")
+	act = req
+	act.startStr = "02:00:00.000000" // already on a keyframe
+	if got, want := cutComment("u", req, act), "Source: u\nRange: 02:00:00-end"; got != want {
+		t.Errorf("got %q want %q", got, want)
 	}
 }

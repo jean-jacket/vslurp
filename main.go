@@ -108,12 +108,13 @@ func main() {
 			errorf("-stream only works with http(s) URLs")
 			os.Exit(2)
 		}
-		os.Exit(runFFmpeg(rng, input, output, false))
+		os.Exit(runFFmpeg(rng, input, output, false, ""))
 	}
 	if o.stream && !confirmOverwrite(output) {
 		os.Exit(1)
 	}
 
+	requested := rng
 	local, rng, err := slurp(ctx, o, input, rng)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -132,7 +133,7 @@ func main() {
 		return
 	}
 	stop() // let Ctrl-C reach ffmpeg normally
-	os.Exit(runFFmpeg(rng, local, output, true))
+	os.Exit(runFFmpeg(rng, local, output, true, cutComment(input, requested, rng)))
 }
 
 // confirmOverwrite asks before replacing an existing regular file, like ffmpeg.
@@ -251,7 +252,7 @@ func parseTime(s string) (float64, error) {
 
 // runFFmpeg cuts with stream copy. snapped means the start is exactly on a
 // keyframe, so timestamps can safely be shifted to begin at zero.
-func runFFmpeg(r timeRange, input, output string, snapped bool) int {
+func runFFmpeg(r timeRange, input, output string, snapped bool, comment string) int {
 	args := []string{"-hide_banner", "-loglevel", "warning"}
 	if r.startStr != "" {
 		args = append(args, "-ss", r.startStr)
@@ -262,6 +263,9 @@ func runFFmpeg(r timeRange, input, output string, snapped bool) int {
 	args = append(args, "-i", input, "-c", "copy")
 	if snapped {
 		args = append(args, "-avoid_negative_ts", "make_zero")
+	}
+	if comment != "" {
+		args = append(args, "-metadata", "comment="+comment)
 	}
 	args = append(args, output)
 	fmt.Fprintf(os.Stderr, "Cutting %s with ffmpeg...\n", output)
@@ -298,6 +302,7 @@ func slurp(ctx context.Context, o options, url string, rng timeRange) (path stri
 }
 
 func slurpInner(ctx context.Context, o options, url string, rng *timeRange) (string, error) {
+	requested := *rng
 	src, err := openSource(ctx, o, url)
 	if err != nil {
 		return "", err
@@ -324,7 +329,7 @@ func slurpInner(ctx context.Context, o options, url string, rng *timeRange) (str
 	}
 
 	if o.stream {
-		return dataPath, streamCut(ctx, d, st, mov, *rng, o.output, dur, r.length)
+		return dataPath, streamCut(ctx, d, st, mov, *rng, o.output, dur, r.length, cutComment(url, requested, *rng))
 	}
 
 	// 2. The bytes for the requested time range.
@@ -483,7 +488,7 @@ func fmtSeconds(s float64) string {
 
 // streamCut writes the cut as a fast-start MP4: the new index first, then the
 // media bytes in order, each stretch as soon as it has been downloaded.
-func streamCut(ctx context.Context, d *downloader, st *store, mov *movie, rng timeRange, output string, dur float64, total int64) error {
+func streamCut(ctx context.Context, d *downloader, st *store, mov *movie, rng timeRange, output string, dur float64, total int64, comment string) error {
 	ftypHdr := make([]byte, 16)
 	if _, err := st.data.ReadAt(ftypHdr, 0); err != nil {
 		return err
@@ -501,7 +506,7 @@ func streamCut(ctx context.Context, d *downloader, st *store, mov *movie, rng ti
 	if end >= dur {
 		end = -1
 	}
-	plan, err := mov.planCut(ftyp, start, end)
+	plan, err := mov.planCut(ftyp, start, end, comment)
 	if err != nil {
 		return fatalError{err}
 	}
@@ -532,4 +537,26 @@ func streamCut(ctx context.Context, d *downloader, st *store, mov *movie, rng ti
 		return fatalError{err}
 	}
 	return out.Close()
+}
+
+// cutComment describes where a cut came from, for the output's comment tag:
+// the source URL and the range actually cut (plus the requested one if the
+// start was moved onto a keyframe).
+func cutComment(url string, requested, actual timeRange) string {
+	side := func(s, missing string) string {
+		if s == "" {
+			return missing
+		}
+		if strings.Contains(s, ".") { // drop trailing zeros from snapped times
+			s = strings.TrimRight(strings.TrimRight(s, "0"), ".")
+		}
+		return s
+	}
+	got := side(actual.startStr, "start") + "-" + side(actual.endStr, "end")
+	asked := side(requested.startStr, "start") + "-" + side(requested.endStr, "end")
+	line := "Range: " + got
+	if got != asked {
+		line += " (requested " + asked + ")"
+	}
+	return "Source: " + url + "\n" + line
 }
