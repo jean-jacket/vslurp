@@ -37,6 +37,7 @@ type options struct {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `Usage: vslurp [flags] START-END INPUT OUTPUT
+       vslurp watch [flags] URL     (play in mpv; see vslurp watch -h)
 
 Downloads only the part of a remote MP4 needed for a time range, then cuts it
 with ffmpeg's stream copy. Run the same command again to resume.
@@ -57,6 +58,9 @@ Flags:
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "watch" {
+		os.Exit(runWatch(os.Args[2:]))
+	}
 	var o options
 	flag.IntVar(&o.conns, "j", 4, "number of parallel connections")
 	flag.IntVar(&o.partMB, "part-size", 8, "download part size in MB")
@@ -294,72 +298,12 @@ func slurp(ctx context.Context, o options, url string, rng timeRange) (path stri
 }
 
 func slurpInner(ctx context.Context, o options, url string, rng *timeRange) (string, error) {
-	r := newRemote(url, o.ua, o.conns)
-	head, err := r.probe(ctx)
+	src, err := openSource(ctx, o, url)
 	if err != nil {
 		return "", err
 	}
-	if len(head) < 8 || string(head[4:8]) != "ftyp" {
-		return "", fatalError{errors.New("this doesn't look like an MP4 file (no ftyp box at the start)")}
-	}
-
-	sum := sha256.Sum256([]byte(url))
-	dir := filepath.Join(o.cacheDir, hex.EncodeToString(sum[:8]))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	lock, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return "", err
-	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return "", fatalError{errors.New("another vslurp is already downloading this file")}
-	}
-	// The lock is held until the process exits.
-
-	metaPath := filepath.Join(dir, "meta.json")
-	var m meta
-	if b, err := os.ReadFile(metaPath); err == nil {
-		_ = json.Unmarshal(b, &m)
-	}
-	if m.URL != url || m.Length != r.length || m.ETag != r.etag || m.MoovEnd == 0 {
-		// New file, or the remote changed: start over.
-		for _, f := range []string{"data.mp4", "have.log", "meta.json"} {
-			os.Remove(filepath.Join(dir, f))
-		}
-		m, err = layout(ctx, r)
-		if err != nil {
-			return "", err
-		}
-		m.URL = url
-		b, _ := json.MarshalIndent(m, "", "  ")
-		if err := os.WriteFile(metaPath, b, 0o644); err != nil {
-			return "", err
-		}
-	}
-
-	dataPath := filepath.Join(dir, "data.mp4")
-	st, err := openStore(dataPath, filepath.Join(dir, "have.log"), r.length)
-	if err != nil {
-		return "", err
-	}
-	defer st.close()
-	d := &downloader{r: r, st: st, conns: o.conns, partSize: int64(o.partMB) << 20}
-
-	// 1. The header and the index (moov). A little of the start of mdat is
-	//    included too, since ffmpeg may peek at it when opening the file.
-	headEnd := min(m.MdatStart+(1<<20), m.MdatEnd)
-	if err := d.fetch(ctx, "index", []span{{0, headEnd}, {m.MoovStart, m.MoovEnd}}); err != nil {
-		return "", err
-	}
-	moov := make([]byte, m.MoovEnd-m.MoovStart)
-	if _, err := st.data.ReadAt(moov, m.MoovStart); err != nil {
-		return "", err
-	}
-	mov, err := parseMoov(moov)
-	if err != nil {
-		return "", fatalError{err}
-	}
+	defer src.st.close()
+	r, m, st, d, dataPath, mov := src.r, src.m, src.st, src.d, src.dataPath, src.mov
 	dur := mov.duration()
 	if rng.start >= dur {
 		return "", fatalError{fmt.Errorf("start time %s is past the end of the video (%s)", rng.startStr, fmtSeconds(dur))}
@@ -395,6 +339,99 @@ func slurpInner(ctx context.Context, o options, url string, rng *timeRange) (str
 		return "", err
 	}
 	return dataPath, nil
+}
+
+// source is a remote MP4 with its local cache opened and its index loaded.
+type source struct {
+	r        *remote
+	m        meta
+	st       *store
+	d        *downloader
+	dataPath string
+	mov      *movie
+	lock     *os.File
+}
+
+// unlock lets other vslurp processes download this file.
+func (s *source) unlock() {
+	syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+	s.lock.Close()
+}
+
+// openSource probes the URL, opens (or resets) its cache folder, makes sure the
+// file's header and index are downloaded, and parses the index. It returns with
+// the cache folder locked.
+func openSource(ctx context.Context, o options, url string) (*source, error) {
+	r := newRemote(url, o.ua, o.conns)
+	head, err := r.probe(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(head) < 8 || string(head[4:8]) != "ftyp" {
+		return nil, fatalError{errors.New("this doesn't look like an MP4 file (no ftyp box at the start)")}
+	}
+
+	sum := sha256.Sum256([]byte(url))
+	dir := filepath.Join(o.cacheDir, hex.EncodeToString(sum[:8]))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	lock, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return nil, fatalError{errors.New("another vslurp is already downloading this file")}
+	}
+	// For a cut the lock is held until the process exits; watch releases it
+	// once the index is in place, since it never writes video data.
+
+	metaPath := filepath.Join(dir, "meta.json")
+	var m meta
+	if b, err := os.ReadFile(metaPath); err == nil {
+		_ = json.Unmarshal(b, &m)
+	}
+	if m.URL != url || m.Length != r.length || m.ETag != r.etag || m.MoovEnd == 0 {
+		// New file, or the remote changed: start over.
+		for _, f := range []string{"data.mp4", "have.log", "meta.json"} {
+			os.Remove(filepath.Join(dir, f))
+		}
+		m, err = layout(ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		m.URL = url
+		b, _ := json.MarshalIndent(m, "", "  ")
+		if err := os.WriteFile(metaPath, b, 0o644); err != nil {
+			return nil, err
+		}
+	}
+
+	dataPath := filepath.Join(dir, "data.mp4")
+	st, err := openStore(dataPath, filepath.Join(dir, "have.log"), r.length)
+	if err != nil {
+		return nil, err
+	}
+	d := &downloader{r: r, st: st, conns: o.conns, partSize: int64(o.partMB) << 20}
+
+	// 1. The header and the index (moov). A little of the start of mdat is
+	//    included too, since ffmpeg may peek at it when opening the file.
+	headEnd := min(m.MdatStart+(1<<20), m.MdatEnd)
+	if err := d.fetch(ctx, "index", []span{{0, headEnd}, {m.MoovStart, m.MoovEnd}}); err != nil {
+		st.close()
+		return nil, err
+	}
+	moov := make([]byte, m.MoovEnd-m.MoovStart)
+	if _, err := st.data.ReadAt(moov, m.MoovStart); err != nil {
+		st.close()
+		return nil, err
+	}
+	mov, err := parseMoov(moov)
+	if err != nil {
+		st.close()
+		return nil, fatalError{err}
+	}
+	return &source{r: r, m: m, st: st, d: d, dataPath: dataPath, mov: mov, lock: lock}, nil
 }
 
 // layout walks the top-level boxes with tiny range requests to find mdat and moov.

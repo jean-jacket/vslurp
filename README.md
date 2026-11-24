@@ -38,6 +38,24 @@ about 2 seconds while mpv has caught up, mpv treats it as the end of the file an
 stops; reopen it with `--start=<position>` to carry on. Writing to a named pipe is not
 supported yet.
 
+## Finding timestamps (`vslurp watch`)
+
+```
+vslurp watch URL                        # opens mpv
+vslurp watch -mpv-args '--hr-seek=no --volume=50' URL   # extra mpv arguments
+vslurp watch URL -- --hr-seek=no        # arguments after -- also go to mpv
+vslurp watch -no-mpv URL                # just print the local URL
+```
+
+Serves the remote video to mpv from a local web server that only this machine can
+reach (127.0.0.1, random port, random secret in the URL). It stops when mpv exits.
+If mpv can't be started, it prints the URL and keeps serving until Ctrl-C.
+
+Only the index is cached on disk, so opening is fast after the first time. Video data
+is downloaded on demand into a fixed memory buffer (`-mem`, default 256 MB) with
+read-ahead (`-readahead`, default 64 MB) and is never saved. Parts already on disk
+from earlier cuts are reused.
+
 ## Flags
 
 | Flag | Default | |
@@ -66,5 +84,5 @@ the temp dir on restart.
 ## Build
 
 ```
-go build -o vslurp ./bin
+go build -o vslurp .
 ```

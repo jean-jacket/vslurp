@@ -304,3 +304,28 @@ func TestPlanCut(t *testing.T) {
 		t.Errorf("open-ended range = %d..%d", plan.lo, plan.hi)
 	}
 }
+
+func TestSplitWords(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"--hr-seek=no --volume=50", []string{"--hr-seek=no", "--volume=50"}},
+		{"  spaced   out  ", []string{"spaced", "out"}},
+		{`--title="my clip" --x='a b'`, []string{"--title=my clip", "--x=a b"}},
+		{`a\ b "c\"d" 'e\f'`, []string{"a b", `c"d`, `e\f`}},
+		{`""`, []string{""}},
+		{"", nil},
+	}
+	for _, c := range cases {
+		got, err := splitWords(c.in)
+		if err != nil || !reflect.DeepEqual(got, c.want) {
+			t.Errorf("splitWords(%q) = %q, %v; want %q", c.in, got, err, c.want)
+		}
+	}
+	for _, bad := range []string{`"open`, `'open`, `trail\`} {
+		if _, err := splitWords(bad); err == nil {
+			t.Errorf("splitWords(%q): expected error", bad)
+		}
+	}
+}
